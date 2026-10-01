@@ -1,0 +1,205 @@
+From 7457790cbb86481862666a1cb4d7837e703c0371 Mon Sep 17 00:00:00 2001
+From: Ian Romanick <ian.d.romanick@intel.com>
+Date: Wed, 15 Jul 2026 12:18:06 -0700
+Subject: [PATCH] brw: Perform dst/src0 register coalesce for DPAS
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On my DG2 A380, improves llama.cpp mistral-7b-v0.1.Q2_K.gguf
+performance by 48.2%±0.09% (n=10).
+
+v2: Process blocks in forward order to facilitate ip tracking, but
+process instructions in reverse order. This allows chaining results from
+dpas to dpas to dpas.
+---
+ src/intel/compiler/brw/brw_opt.cpp      |   1 +
+ src/intel/compiler/brw/brw_opt_dpas.cpp | 138 ++++++++++++++++++++++++
+ src/intel/compiler/brw/brw_shader.h     |   1 +
+ src/intel/compiler/brw/meson.build      |   1 +
+ 4 files changed, 141 insertions(+)
+ create mode 100644 src/intel/compiler/brw/brw_opt_dpas.cpp
+
+diff --git a/src/intel/compiler/brw/brw_opt.cpp b/src/intel/compiler/brw/brw_opt.cpp
+index 5c3985ff242..28b6a08c28f 100644
+--- a/src/intel/compiler/brw/brw_opt.cpp
++++ b/src/intel/compiler/brw/brw_opt.cpp
+@@ -197,6 +197,7 @@ brw_optimize(brw_shader &s)
+ 
+    OPT(brw_opt_dead_code_eliminate);
+    OPT(brw_opt_register_coalesce);
++   OPT(brw_opt_dpas_dst_src0_coalesce);
+ 
+    /* Logical sends and load_payload can have large VGRFs that cannot be
+     * split. Once all of the lowering passes and optimization passes that
+diff --git a/src/intel/compiler/brw/brw_opt_dpas.cpp b/src/intel/compiler/brw/brw_opt_dpas.cpp
+new file mode 100644
+index 00000000000..5fb99fd19d8
+--- /dev/null
++++ b/src/intel/compiler/brw/brw_opt_dpas.cpp
+@@ -0,0 +1,138 @@
++/*
++ * Copyright © 2026 Intel Corporation
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "brw_shader.h"
++#include "brw_builder.h"
++#include "brw_cfg.h"
++
++/** @file
++ *
++ */
++
++/**
++ * Make a DPAS instruction use src0 as the destination.
++ *
++ * Many applications, like llama.cpp, have code like:
++ *
++ *    load_payload(32) v4:UD, 0u, 0u
++ *    ...
++ *    do
++ *        ...
++ *        dpas(16) v590:HF, v4:HF, %588:HF, %589:HF NoMask group0
++ *        ...
++ *        dpas(16) v4:HF, v590:HF, %614:HF, %615:HF NoMask group0
++ *        ...
++ *    while
++ *
++ * This case can be detected, and both instructions can be modified to use v4
++ * as src0 and destination.
++ */
++bool
++brw_opt_dpas_dst_src0_coalesce(brw_shader &s)
++{
++   brw_live_variables &live = s.live_analysis.require();
++   bool progress = false;
++   int next_block_first_ip = 0;
++
++   foreach_block(block, s.cfg) {
++      next_block_first_ip += block->num_instructions;
++
++      int ip = next_block_first_ip;
++      foreach_inst_in_block_reverse(brw_inst, inst, block) {
++         --ip;
++
++         if (inst->opcode != BRW_OPCODE_DPAS)
++            continue;
++
++         if (inst->dst.file != VGRF || inst->src[0].file != VGRF)
++            continue;
++
++         if (inst->dst.nr == inst->src[0].nr)
++            continue;
++
++         /* If the DPAS is the end of the live range of src0, the optimization
++          * may be able to proceed.
++          */
++         assert(live.vgrf_range[inst->src[0].nr].contains(ip));
++         if (live.vgrf_range[inst->src[0].nr].last() != ip)
++            continue;
++
++         const unsigned src0_size_read = inst->size_read(s.devinfo, 0);
++
++         bool bad_source = false;
++
++         /* If some other source of inst also reads the same register as src0, do
++          * not perform the optimization.
++          */
++         for (unsigned i = 1; i < inst->sources; i++) {
++            if (regions_overlap(inst->src[i],
++                                inst->size_read(s.devinfo, i),
++                                inst->src[0],
++                                src0_size_read)) {
++               bad_source = true;
++               break;
++            }
++         }
++
++         if (bad_source)
++            continue;
++
++         /* Walk backwards looking for an instruction that writes all of src0. If
++          * a read of dst is found along the way, the optimization cannot
++          * proceed.
++          */
++         foreach_inst_in_block_reverse_starting_from(brw_inst, scan_inst, inst) {
++            if (regions_overlap(scan_inst->dst, scan_inst->size_written,
++                                inst->src[0], src0_size_read)) {
++               if (scan_inst->dst.offset != inst->src[0].offset ||
++                   scan_inst->size_written != src0_size_read ||
++                   !scan_inst->dst.is_contiguous() ||
++                   scan_inst->predicate)
++                  break;
++
++               /* Modify scan_inst to write inst->dst. */
++               scan_inst->dst.nr = inst->dst.nr;
++
++               /* Modify every instruction from scan_inst to inst (including
++                * inst) that reads src0 to instead read inst->dst.
++                */
++               foreach_inst_in_block_starting_from(brw_inst, fix_inst, scan_inst) {
++                  for (unsigned i = 0; i < fix_inst->sources; i++) {
++                     if (regions_overlap(fix_inst->src[i],
++                                         fix_inst->size_read(s.devinfo, i),
++                                         inst->src[0],
++                                         src0_size_read)) {
++                        fix_inst->src[i].nr = inst->dst.nr;
++                     }
++
++                     if (fix_inst == inst)
++                        break;
++                  }
++               }
++
++               progress = true;
++            }
++
++            for (unsigned i = 0; i < scan_inst->sources; i++) {
++               if (regions_overlap(scan_inst->src[i],
++                                   scan_inst->size_read(s.devinfo, i),
++                                   inst->src[0],
++                                   src0_size_read)) {
++                  bad_source = true;
++                  break;
++               }
++            }
++
++            if (bad_source)
++               break;
++         }
++      }
++   }
++
++   if (progress)
++      s.invalidate_analysis(BRW_DEPENDENCY_INSTRUCTIONS);
++
++   return progress;
++}
+diff --git a/src/intel/compiler/brw/brw_shader.h b/src/intel/compiler/brw/brw_shader.h
+index 415d0d29d9a..404b4f2b9e4 100644
+--- a/src/intel/compiler/brw/brw_shader.h
++++ b/src/intel/compiler/brw/brw_shader.h
+@@ -367,6 +367,7 @@ bool brw_opt_copy_propagation(brw_shader &s);
+ bool brw_opt_copy_propagation_defs(brw_shader &s);
+ bool brw_opt_cse_defs(brw_shader &s);
+ bool brw_opt_dead_code_eliminate(brw_shader &s);
++bool brw_opt_dpas_dst_src0_coalesce(brw_shader &s);
+ bool brw_opt_eliminate_find_live_channel(brw_shader &s);
+ bool brw_opt_fill_and_spill(brw_shader &s);
+ bool brw_opt_mac(brw_shader &s);
+diff --git a/src/intel/compiler/brw/meson.build b/src/intel/compiler/brw/meson.build
+index 0eea8fe2b0a..5545f4a0df3 100644
+--- a/src/intel/compiler/brw/meson.build
++++ b/src/intel/compiler/brw/meson.build
+@@ -78,6 +78,7 @@ libintel_compiler_brw_files = files(
+   'brw_opt_copy_propagation.cpp',
+   'brw_opt_cse.cpp',
+   'brw_opt_dead_code_eliminate.cpp',
++  'brw_opt_dpas.cpp',
+   'brw_opt_fill_spill.cpp',
+   'brw_opt_mac.cpp',
+   'brw_opt_predicate_logic.cpp',
+-- 
+2.55.0
+

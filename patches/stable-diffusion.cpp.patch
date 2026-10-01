@@ -1,0 +1,1125 @@
+diff --git c/docs/minimax_h3.md w/docs/minimax_h3.md
+index 82d0e2f..81f79d1 100644
+--- c/docs/minimax_h3.md
++++ w/docs/minimax_h3.md
+@@ -54,6 +54,12 @@ Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA:
+ .\bin\Release\sd-cli.exe -M vid_gen --diffusion-model  ..\models\diffusion_models\minimax_h3_fl2va-Q4_K_M.gguf --vae ..\models\vae\minimax_h3_video_vae_fp16.safetensors --audio-vae ..\models\vae\minimax_h3_audio_vae_fp32.safetensors --llm ..\models\text_encoders\qwen3vl_32b_minimax_h3-Q4_K_M.gguf -p "a lovely cat" -i ..\assets\ernie_image\turbo_example.png --cfg-scale 1.0 -v -W 864 -H 480 --diffusion-fa --offload-to-cpu --rng cpu --fps 24 --video-frames 56
+ ```
+ 
++`--init-img-strength` and `--end-img-strength` (default `1.0`) map to Comfy's
++`visual_cond_noise_aug`. `1.0` pins that keyframe at t=0.999. Lower values mix
++noise into the cond latent and lower its timestep pin. `0` skips that frame.
++Start and end can differ.
++
++
+ <video src=../assets/minimax-h3/i2av.mp4 controls="controls" muted="muted" type="video/mp4"></video>
+ 
+ ## Reference-to-audio-video conditioning
+diff --git c/examples/cli/main.cpp w/examples/cli/main.cpp
+index dc79b8c..f76415a 100644
+--- c/examples/cli/main.cpp
++++ w/examples/cli/main.cpp
+@@ -821,6 +821,62 @@ int main(int argc, const char* argv[]) {
+         }
+     }
+ 
++    auto split_spec = [](const std::string& spec, std::string& path, int& frame, float& strength) -> bool {
++        std::vector<std::string> parts;
++        size_t at = spec.find('@');
++        path      = spec.substr(0, at);
++        while (at != std::string::npos) {
++            size_t start = at + 1;
++            at           = spec.find('@', start);
++            parts.push_back(spec.substr(start, at == std::string::npos ? std::string::npos : at - start));
++        }
++        if (path.empty() || parts.empty() || parts.size() > 2) {
++            return false;
++        }
++        try {
++            frame    = std::stoi(parts[0]);
++            strength = parts.size() > 1 ? std::stof(parts[1]) : 1.f;
++        } catch (...) {
++            return false;
++        }
++        return true;
++    };
++
++    gen_params.guide_images.clear();
++    gen_params.guide_frame_idxs.clear();
++    gen_params.guide_strengths.clear();
++    for (const auto& spec : gen_params.guide_specs) {
++        std::string path;
++        int frame      = 0;
++        float strength = 1.f;
++        if (!split_spec(spec, path, frame, strength)) {
++            LOG_ERROR("invalid --guide '%s', expected PATH@FRAME[@STRENGTH]", spec.c_str());
++            return 1;
++        }
++        SDImageOwner image({0, 0, 0, nullptr});
++        if (!load_image_and_update_size(path, image)) {
++            return 1;
++        }
++        gen_params.guide_images.push_back(std::move(image));
++        gen_params.guide_frame_idxs.push_back(frame);
++        gen_params.guide_strengths.push_back(strength);
++    }
++
++    gen_params.guide_audios.clear();
++    gen_params.guide_audio_frame_idxs.clear();
++    gen_params.guide_audios.resize(gen_params.guide_audio_specs.size());
++    for (size_t i = 0; i < gen_params.guide_audio_specs.size(); ++i) {
++        std::string path;
++        int frame      = 0;
++        float strength = 1.f;
++        if (!split_spec(gen_params.guide_audio_specs[i], path, frame, strength) ||
++            !load_audio(path, gen_params.guide_audios[i])) {
++            LOG_ERROR("invalid --guide-audio '%s', expected PATH@FRAME", gen_params.guide_audio_specs[i].c_str());
++            return 1;
++        }
++        gen_params.guide_audio_frame_idxs.push_back(frame);
++    }
++
+     if (gen_params.mask_image_path.size() > 0) {
+         if (!load_sd_image_from_file(gen_params.mask_image.put(),
+                                      gen_params.mask_image_path.c_str(),
+diff --git c/examples/common/common.cpp w/examples/common/common.cpp
+index dc15b4e..abf16a4 100644
+--- c/examples/common/common.cpp
++++ w/examples/common/common.cpp
+@@ -1278,6 +1278,14 @@ ArgOptions SDGenerationParams::get_options() {
+          "--strength",
+          "strength for noising/unnoising (default: 0.75)",
+          &strength},
++        {"",
++         "--init-img-strength",
++         "MiniMax-H3 first-frame keyframe strength (default: 1.0)",
++         &init_image_strength},
++        {"",
++         "--end-img-strength",
++         "MiniMax-H3 last-frame keyframe strength (default: 1.0)",
++         &end_image_strength},
+         {"",
+          "--pm-style-strength",
+          "",
+@@ -1544,6 +1552,22 @@ ArgOptions SDGenerationParams::get_options() {
+         return 1;
+     };
+ 
++    auto on_guide_arg = [&](int argc, const char** argv, int index) {
++        if (++index >= argc) {
++            return -1;
++        }
++        guide_specs.push_back(argv[index]);
++        return 1;
++    };
++
++    auto on_guide_audio_arg = [&](int argc, const char** argv, int index) {
++        if (++index >= argc) {
++            return -1;
++        }
++        guide_audio_specs.push_back(argv[index]);
++        return 1;
++    };
++
+     auto on_audio_arg = [&](int argc, const char** argv, int index) {
+         if (++index >= argc) {
+             return -1;
+@@ -1741,6 +1765,15 @@ ArgOptions SDGenerationParams::get_options() {
+          "--ref-audio",
+          "standalone WAV reference for MiniMax-H3 Ref2VA (can be used multiple times)",
+          on_ref_audio_arg},
++        {"",
++         "--guide",
++         "MiniMax-H3 image guide PATH@FRAME[@STRENGTH] anchored at a target frame, combinable with Ref2VA "
++         "(negative FRAME counts from the end; can be used multiple times)",
++         on_guide_arg},
++        {"",
++         "--guide-audio",
++         "MiniMax-H3 WAV guide PATH@FRAME anchored at a target frame (can be used multiple times)",
++         on_guide_audio_arg},
+         {"",
+          "--audio",
+          "driving audio track (Wan2.2 S2V; can be used once)",
+@@ -2100,6 +2133,8 @@ bool SDGenerationParams::from_json_str(
+     load_if_exists("seed", seed);
+ 
+     load_if_exists("strength", strength);
++    load_if_exists("init_image_strength", init_image_strength);
++    load_if_exists("end_image_strength", end_image_strength);
+     load_if_exists("control_strength", control_strength);
+     load_if_exists("ip_adapter_strength", ip_adapter_strength);
+     load_if_exists("moe_boundary", moe_boundary);
+@@ -2780,6 +2815,22 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
+                                    audio});
+     }
+ 
++    guide_views.clear();
++    for (size_t i = 0; i < guide_images.size(); ++i) {
++        sd_minimax_guide_t guide = {};
++        guide.image              = guide_images[i].get();
++        guide.frame_idx          = guide_frame_idxs[i];
++        guide.strength           = guide_strengths[i];
++        guide_views.push_back(guide);
++    }
++    for (size_t i = 0; i < guide_audios.size(); ++i) {
++        sd_minimax_guide_t guide = {};
++        guide.audio              = guide_audios[i].get();
++        guide.frame_idx          = guide_audio_frame_idxs[i];
++        guide.strength           = 1.f;
++        guide_views.push_back(guide);
++    }
++
+     ref_audio_views.clear();
+     ref_audio_views.reserve(ref_audios.size());
+     for (auto& audio : ref_audios) {
+@@ -2803,13 +2854,17 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
+     params.negative_prompt           = negative_prompt.c_str();
+     params.clip_skip                 = clip_skip;
+     params.init_image                = init_image.get();
++    params.init_image_strength       = init_image_strength;
+     params.end_image                 = end_image.get();
++    params.end_image_strength        = end_image_strength;
+     params.ref_images                = ref_image_views.empty() ? nullptr : ref_image_views.data();
+     params.ref_images_count          = static_cast<int>(ref_image_views.size());
+     params.ref_videos                = ref_video_views.empty() ? nullptr : ref_video_views.data();
+     params.ref_videos_count          = static_cast<int>(ref_video_views.size());
+     params.ref_audios                = ref_audio_views.empty() ? nullptr : ref_audio_views.data();
+     params.ref_audios_count          = static_cast<int>(ref_audio_views.size());
++    params.guides                    = guide_views.empty() ? nullptr : guide_views.data();
++    params.guides_count              = static_cast<int>(guide_views.size());
+     params.control_frames            = control_frame_views.empty() ? nullptr : control_frame_views.data();
+     params.control_frames_size       = static_cast<int>(control_frame_views.size());
+     params.width                     = get_resolved_width();
+@@ -2887,6 +2942,8 @@ std::string SDGenerationParams::to_string() const {
+         << "  qwen_image_layers: " << qwen_image_layers << ",\n"
+         << "  init_image_path: \"" << init_image_path << "\",\n"
+         << "  end_image_path: \"" << end_image_path << "\",\n"
++        << "  init_image_strength: " << init_image_strength << ",\n"
++        << "  end_image_strength: " << end_image_strength << ",\n"
+         << "  mask_image_path: \"" << mask_image_path << "\",\n"
+         << "  control_image_path: \"" << control_image_path << "\",\n"
+         << "  ref_image_paths: " << vec_str_to_string(ref_image_paths) << ",\n"
+diff --git c/examples/common/common.h w/examples/common/common.h
+index d0d39b7..493bddf 100644
+--- c/examples/common/common.h
++++ w/examples/common/common.h
+@@ -215,6 +215,8 @@ struct SDGenerationParams {
+ 
+     std::string init_image_path;
+     std::string end_image_path;
++    float init_image_strength = 1.0f;
++    float end_image_strength  = 1.0f;
+     std::string mask_image_path;
+     std::string control_image_path;
+     std::string ip_adapter_image_path;
+@@ -222,6 +224,8 @@ struct SDGenerationParams {
+     std::vector<std::string> ref_video_paths;
+     std::vector<std::string> ref_video_audio_paths;
+     std::vector<std::string> ref_audio_paths;
++    std::vector<std::string> guide_specs;        // MiniMax-H3 image guides: PATH@FRAME[@STRENGTH]
++    std::vector<std::string> guide_audio_specs;  // MiniMax-H3 audio guides: PATH@FRAME
+     std::string control_video_path;
+ 
+     sd_sample_params_t sample_params;
+@@ -289,6 +293,11 @@ struct SDGenerationParams {
+     std::vector<std::vector<SDImageOwner>> ref_videos;
+     std::vector<SDAudioOwner> ref_video_audios;
+     std::vector<SDAudioOwner> ref_audios;
++    std::vector<SDImageOwner> guide_images;
++    std::vector<SDAudioOwner> guide_audios;
++    std::vector<int> guide_frame_idxs;
++    std::vector<float> guide_strengths;
++    std::vector<int> guide_audio_frame_idxs;
+     SDImageOwner mask_image;
+     SDImageOwner control_image;
+     SDImageOwner ip_adapter_image;
+@@ -300,6 +309,7 @@ struct SDGenerationParams {
+     std::vector<std::vector<sd_image_t>> ref_video_frame_views;
+     std::vector<sd_ref_video_t> ref_video_views;
+     std::vector<sd_audio_t> ref_audio_views;
++    std::vector<sd_minimax_guide_t> guide_views;
+     std::vector<sd_image_t> pm_id_image_views;
+     std::vector<sd_image_t> control_frame_views;
+ 
+diff --git c/include/stable-diffusion.h w/include/stable-diffusion.h
+index 8e5577d..8aaab41 100644
+--- c/include/stable-diffusion.h
++++ w/include/stable-diffusion.h
+@@ -278,6 +278,15 @@ typedef struct {
+     sd_audio_t audio;
+ } sd_ref_video_t;
+ 
++// MiniMax-H3 guide anchored at a target pixel frame (ComfyUI MiniMaxH3AddGuide).
++// Either image or audio may be empty (data == NULL). Combines with Ref2VA references.
++typedef struct {
++    sd_image_t image;
++    sd_audio_t audio;
++    int frame_idx;   // negative counts from the end
++    float strength;  // visual_cond_noise_aug; 1.0 pins at t=0.999
++} sd_minimax_guide_t;
++
+ typedef struct {
+     int* layers;
+     size_t layer_count;
+@@ -428,13 +437,17 @@ typedef struct {
+     const char* negative_prompt;
+     int clip_skip;
+     sd_image_t init_image;
++    float init_image_strength;
+     sd_image_t end_image;
++    float end_image_strength;
+     sd_image_t* ref_images;
+     int ref_images_count;
+     sd_ref_video_t* ref_videos;
+     int ref_videos_count;
+     sd_audio_t* ref_audios;
+     int ref_audios_count;
++    sd_minimax_guide_t* guides;
++    int guides_count;
+     sd_image_t* control_frames;
+     int control_frames_size;
+     int width;
+diff --git c/src/conditioning/conditioner.hpp w/src/conditioning/conditioner.hpp
+index 7796a40..cec6332 100644
+--- c/src/conditioning/conditioner.hpp
++++ w/src/conditioning/conditioner.hpp
+@@ -36,6 +36,7 @@ struct SDCondition {
+     std::vector<sd::Tensor<float>> c_ref_images;
+     std::vector<sd::Tensor<float>> c_ref_audios;
+     std::vector<MiniMaxH3ReferenceBlock> c_reference_blocks;
++    std::vector<float> c_visual_cond_augs;
+ 
+     std::vector<sd::Tensor<float>> extra_c_crossattns;
+ 
+diff --git c/src/core/compute_workspace.cpp w/src/core/compute_workspace.cpp
+index 54f0538..dc76d1b 100644
+--- c/src/core/compute_workspace.cpp
++++ w/src/core/compute_workspace.cpp
+@@ -32,12 +32,25 @@ namespace sd {
+         if (!extra_backends_.empty()) {
+             return true;
+         }
++        bool needs = false;
++        static const bool log_unsupported = getenv("SD_LOG_UNSUPPORTED_OPS") != nullptr;
+         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+-            if (!ggml_backend_supports_op(backend_, ggml_graph_node(graph, i))) {
+-                return true;
++            ggml_tensor* node = ggml_graph_node(graph, i);
++            if (!ggml_backend_supports_op(backend_, node)) {
++                if (!log_unsupported) {
++                    return true;
++                }
++                needs = true;
++                LOG_WARN("unsupported on %s: %s %s type=%s src0=%s src1=%s src2=%s ne=[%lld,%lld,%lld,%lld] contiguous=%d",
++                         ggml_backend_name(backend_), ggml_op_desc(node), node->name, ggml_type_name(node->type),
++                         node->src[0] ? ggml_type_name(node->src[0]->type) : "-",
++                         node->src[1] ? ggml_type_name(node->src[1]->type) : "-",
++                         node->src[2] ? ggml_type_name(node->src[2]->type) : "-",
++                         (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2], (long long)node->ne[3],
++                         node->src[0] ? (int)ggml_is_contiguous(node->src[0]) : -1);
+             }
+         }
+-        return false;
++        return needs;
+     }
+ 
+     ggml_backend_sched_t ComputeWorkspace::make_scheduler(size_t graph_size) {
+diff --git c/src/core/ggml_extend.cpp w/src/core/ggml_extend.cpp
+index d87353d..660990b 100644
+--- c/src/core/ggml_extend.cpp
++++ w/src/core/ggml_extend.cpp
+@@ -1,6 +1,9 @@
+ #include "core/ggml_extend.h"
+ 
+ #include <cmath>
++#include <dlfcn.h>
++
++#include "core/util.h"
+ #include <stdexcept>
+ #include <utility>
+ 
+@@ -761,6 +764,137 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
+     }
+ #endif
+ 
++    // Attention offload to an Intel XPU through libtorch (SD_XPU_SDPA_LIB=path/to/libxpu_sdpa.so).
++    // On Arc Pro B70 its oneDNN/SYCL kernels run ~5x faster than any Vulkan FA path, because Vulkan
++    // compute on Xe2 is limited to 128 GRFs. Q/K/V are cast to head-major f16 on the device; a CPU-side
++    // custom op calls the library, and the scheduler moves the tensors across PCIe.
++    using xpu_sdpa_fn = int (*)(const void*, const void*, const void*, void*, int64_t, int64_t, int64_t,
++                                int64_t, int64_t, double, int);
++    static const xpu_sdpa_fn xpu_sdpa = []() -> xpu_sdpa_fn {
++        const char* path = getenv("SD_XPU_SDPA_LIB");
++        if (path == nullptr) {
++            return nullptr;
++        }
++        void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++        if (lib == nullptr) {
++            LOG_ERROR("SD_XPU_SDPA_LIB: dlopen failed: %s", dlerror());
++            return nullptr;
++        }
++        auto fn = reinterpret_cast<xpu_sdpa_fn>(dlsym(lib, "xpu_sdpa_f16"));
++        if (fn == nullptr) {
++            LOG_ERROR("SD_XPU_SDPA_LIB: xpu_sdpa_f16 not found");
++        } else {
++            LOG_INFO("attention offload: %s", path);
++        }
++        return fn;
++    }();
++    if (kqv == nullptr && xpu_sdpa != nullptr && skip_reshape && mask == nullptr && N == 1 &&
++        q->type == GGML_TYPE_F32 && ggml_n_dims(q) <= 3 && n_head % n_kv_head == 0) {
++        auto q_in = ggml_cast(ctx, ggml_reshape_3d(ctx, ggml_ext_cont(ctx, q), d_head, L_q, n_head), GGML_TYPE_F16);
++        auto k_in = ggml_reshape_3d(ctx, ggml_ext_cont(ctx, k), d_head, L_k, n_kv_head);
++        auto v_in = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, ggml_ext_cont(ctx, v), d_head, n_kv_head, L_k), 0, 2, 1, 3));
++        if (kv_scale != 1.0f) {
++            k_in = ggml_ext_scale(ctx, k_in, kv_scale);
++            v_in = ggml_ext_scale(ctx, v_in, kv_scale);
++        }
++        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);  // [d, L_k, H_kv] = head-major
++        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
++        ggml_tensor* args[3] = {q_in, k_in, v_in};
++        struct XpuArgs {
++            xpu_sdpa_fn fn;
++            float scale;
++        };
++        static XpuArgs xpu_args;
++        xpu_args.fn    = xpu_sdpa;
++        xpu_args.scale = scale / kv_scale;
++        auto op = [](ggml_tensor* dst, int ith, int, void* userdata) {
++            if (ith != 0) {
++                return;
++            }
++            static const bool verbose = getenv("SD_XPU_SDPA_VERBOSE") != nullptr;
++            auto* a          = static_cast<XpuArgs*>(userdata);
++            const auto* qq   = dst->src[0];
++            const auto* kk   = dst->src[1];
++            const auto* vv   = dst->src[2];
++            int rc = a->fn(qq->data, kk->data, vv->data, dst->data,
++                           qq->ne[2], qq->ne[1], kk->ne[1], kk->ne[2], qq->ne[0], a->scale, verbose ? 1 : 0);
++            GGML_ASSERT(rc == 0 && "xpu_sdpa failed");
++        };
++        // f16 output halves the device->host->device traffic; cast back on the Vulkan side
++        auto out = ggml_custom_4d(ctx, GGML_TYPE_F16, d_head, n_head, L_q, 1, args, 3, op, 1, &xpu_args);
++        out      = ggml_cast(ctx, out, GGML_TYPE_F32);
++        if (kv_scale != 1.0f) {
++            out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
++        }
++        if (used_flash_attn != nullptr) {
++            *used_flash_attn = true;
++        }
++        kqv = ggml_view_4d(ctx, out, d_head, n_head, L_q, N, out->nb[1], out->nb[2], out->nb[1] * n_head, 0);
++    }
++
++    // Intel Xe2 Vulkan prefill flash attention wants head-interleaved Q/K/V ([d, L, H] views over
++    // [d, H, L] memory) and an unmasked KV length that is a multiple of 32. Pad K/V with zeros and
++    // record the real key count in op_params[5]; the kernel gives the padded keys -inf.
++    static const bool xe_fa = getenv("SD_VK_XE_FA") != nullptr;
++    if (kqv == nullptr && flash_attn && xe_fa && skip_reshape && mask == nullptr &&
++        sd_backend_is(backend, "Vulkan") && d_head % 32 == 0 && q->type == GGML_TYPE_F32 && ggml_n_dims(q) <= 3) {
++        // pad to the kernel's keys-per-iteration (GGML_VK_XE_FA_PITER, up to 64) so the last tile stays in bounds
++        const int64_t L_k_pad = (L_k + 63) / 64 * 64;
++        auto q_in             = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, q), d_head, L_q, n_head, N);
++        q_in                  = ggml_cont(ctx, ggml_permute(ctx, q_in, 0, 2, 1, 3));  // [d, H, L_q, N]
++        q_in                  = ggml_permute(ctx, q_in, 0, 2, 1, 3);                  // view [d, L_q, H, N]
++
++        auto k_in = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, k), d_head, L_k, n_kv_head, N);
++        if (kv_scale != 1.0f) {
++            k_in = ggml_ext_scale(ctx, k_in, kv_scale);
++        }
++        if (L_k_pad != L_k) {
++            k_in = ggml_pad(ctx, k_in, 0, static_cast<int>(L_k_pad - L_k), 0, 0);
++        }
++        k_in = ggml_cast(ctx, ggml_permute(ctx, k_in, 0, 2, 1, 3), GGML_TYPE_F16);  // [d, H, L_k_pad, N]
++        k_in = ggml_permute(ctx, k_in, 0, 2, 1, 3);                                 // view [d, L_k_pad, H, N]
++
++        auto v_in = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, v), d_head, n_kv_head, L_k, N);  // [d, H, L_k, N]
++        if (kv_scale != 1.0f) {
++            v_in = ggml_ext_scale(ctx, v_in, kv_scale);
++        }
++        if (L_k_pad != L_k) {
++            v_in = ggml_pad(ctx, v_in, 0, 0, static_cast<int>(L_k_pad - L_k), 0);
++        }
++        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
++        v_in = ggml_permute(ctx, v_in, 0, 2, 1, 3);  // view [d, L_k_pad, H, N]
++
++        // Split queries so no single dispatch outlives the GPU job timeout (xe: 5 s by default).
++        static const int64_t q_chunk = [] {
++            const char* value = getenv("SD_VK_XE_FA_QCHUNK");
++            return value != nullptr ? std::max<int64_t>(256, std::atoll(value)) : int64_t(8192);
++        }();
++        ggml_tensor* out = nullptr;
++        bool supported   = true;
++        for (int64_t start = 0; start < L_q && supported; start += q_chunk) {
++            int64_t len  = std::min(q_chunk, L_q - start);
++            auto q_chunk_in = ggml_view_4d(ctx, q_in, d_head, len, n_head, N,
++                                           q_in->nb[1], q_in->nb[2], q_in->nb[3], start * q_in->nb[1]);
++            auto part = ggml_flash_attn_ext(ctx, q_chunk_in, k_in, v_in, nullptr, scale / kv_scale, 0, 0);
++            if (!ggml_backend_supports_op(backend, part)) {
++                supported = false;
++                break;
++            }
++            ggml_flash_attn_ext_set_prec(part, GGML_PREC_F32);
++            part->op_params[5] = static_cast<int32_t>(L_k);  // read by the Vulkan Xe prefill kernel
++            out                = out == nullptr ? part : ggml_concat(ctx, out, part, 2);  // [d, H, L_q, N]
++        }
++        if (supported && out != nullptr) {
++            if (kv_scale != 1.0f) {
++                out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
++            }
++            if (used_flash_attn != nullptr) {
++                *used_flash_attn = true;
++            }
++            kqv = ggml_view_4d(ctx, out, d_head, n_head, L_q, N, out->nb[1], out->nb[2], out->nb[1] * n_head, 0);
++        }
++    }
++
+     if (kqv == nullptr && (flash_attn || sage_attn)) {
+         // LOG_VERBOSE("attention_ext L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
+         bool can_use_flash_attn = true;
+diff --git c/src/model/diffusion/minimax_h3.hpp w/src/model/diffusion/minimax_h3.hpp
+index ed7c5ac..98ff959 100644
+--- c/src/model/diffusion/minimax_h3.hpp
++++ w/src/model/diffusion/minimax_h3.hpp
+@@ -2,6 +2,7 @@
+ #define __SD_MODEL_DIFFUSION_MINIMAX_H3_HPP__
+ 
+ #include <algorithm>
++#include <dlfcn.h>
+ #include <cinttypes>
+ #include <cmath>
+ #include <set>
+@@ -138,6 +139,16 @@ namespace MiniMaxH3 {
+         }
+     };
+ 
++    // Token rows per projection chunk (SD_H3_TOKEN_CHUNK, 0 disables). Keeps every activation
++    // below the 4 GiB Vulkan storage-buffer limit at high resolution.
++    static int64_t token_chunk_size() {
++        static const int64_t value = [] {
++            const char* env = getenv("SD_H3_TOKEN_CHUNK");
++            return env != nullptr ? static_cast<int64_t>(std::atoll(env)) : int64_t(16384);
++        }();
++        return value;
++    }
++
+     struct MLP : public UnaryBlock {
+         MLP(int64_t hidden_size,
+             int64_t ffn_hidden_size) {
+@@ -145,7 +156,7 @@ namespace MiniMaxH3 {
+             blocks["fc2"] = std::make_shared<Linear>(ffn_hidden_size, hidden_size, false, false, true, 1.f / 128.f);
+         }
+ 
+-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
++        ggml_tensor* forward_rows(GGMLRunnerContext* ctx, ggml_tensor* x) {
+             auto fc1 = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
+             auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
+             auto uv  = ggml_ext_chunk(ctx->ggml_ctx, fc1->forward(ctx, x), 2, 0);
+@@ -153,6 +164,25 @@ namespace MiniMaxH3 {
+                                               ggml_silu(ctx->ggml_ctx, uv[0]),
+                                               uv[1]));
+         }
++
++        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
++            // fc1 output is 2 * ffn_hidden_size floats per token; at ~44k tokens it passes the 4 GiB
++            // Vulkan storage-buffer limit and the whole MLP falls back to CPU. Run it in token chunks.
++            const int64_t chunk = token_chunk_size();
++            const int64_t rows  = ggml_nrows(x);
++            if (chunk <= 0 || rows <= chunk) {
++                return forward_rows(ctx, x);
++            }
++            auto flat       = ggml_reshape_2d(ctx->ggml_ctx, ggml_ext_cont(ctx->ggml_ctx, x), x->ne[0], rows);
++            ggml_tensor* out = nullptr;
++            for (int64_t start = 0; start < rows; start += chunk) {
++                int64_t len = std::min(chunk, rows - start);
++                auto part   = ggml_view_2d(ctx->ggml_ctx, flat, flat->ne[0], len, flat->nb[1], start * flat->nb[1]);
++                auto y      = forward_rows(ctx, part);
++                out         = out == nullptr ? y : ggml_concat(ctx->ggml_ctx, out, y, 1);
++            }
++            return ggml_reshape_4d(ctx->ggml_ctx, out, out->ne[0], x->ne[1], x->ne[2], x->ne[3]);
++        }
+     };
+ 
+     static ggml_tensor* attention_layout(ggml_context* ctx, ggml_tensor* x) {
+@@ -202,7 +232,26 @@ namespace MiniMaxH3 {
+ 
+             int64_t sequence = x->ne[1];
+             int64_t batch    = x->ne[2] * x->ne[3];
+-            auto qkv         = ggml_ext_chunk(ctx->ggml_ctx, qkv_proj->forward(ctx, x), 3, 0);
++            std::vector<ggml_tensor*> qkv;
++            const int64_t chunk = token_chunk_size();
++            const int64_t rows  = sequence * batch;
++            if (chunk <= 0 || rows <= chunk) {
++                qkv = ggml_ext_chunk(ctx->ggml_ctx, qkv_proj->forward(ctx, x), 3, 0);
++            } else {
++                // Project per token chunk and concatenate q/k/v separately so the fused
++                // [3 * inner, tokens] tensor never exists.
++                auto flat = ggml_reshape_2d(ctx->ggml_ctx, ggml_ext_cont(ctx->ggml_ctx, x), x->ne[0], rows);
++                qkv.assign(3, nullptr);
++                for (int64_t start = 0; start < rows; start += chunk) {
++                    int64_t len = std::min(chunk, rows - start);
++                    auto part   = ggml_view_2d(ctx->ggml_ctx, flat, flat->ne[0], len, flat->nb[1], start * flat->nb[1]);
++                    auto pieces = ggml_ext_chunk(ctx->ggml_ctx, qkv_proj->forward(ctx, part), 3, 0);
++                    for (int i = 0; i < 3; ++i) {
++                        auto piece = ggml_cont(ctx->ggml_ctx, pieces[i]);
++                        qkv[i]     = qkv[i] == nullptr ? piece : ggml_concat(ctx->ggml_ctx, qkv[i], piece, 1);
++                    }
++                }
++            }
+             auto q           = ggml_reshape_4d(ctx->ggml_ctx, qkv[0], head_dim, heads, sequence, batch);
+             auto k           = ggml_reshape_4d(ctx->ggml_ctx, qkv[1], head_dim, heads, sequence, batch);
+             auto v           = ggml_reshape_4d(ctx->ggml_ctx, qkv[2], head_dim, heads, sequence, batch);
+@@ -489,6 +538,32 @@ namespace MiniMaxH3 {
+         }
+     };
+ 
++    using XpuH3BlocksFn = int (*)(const float*, int64_t, int64_t, const float*, int64_t, int64_t, const float*, int64_t,
++                                  const int64_t*, int64_t, int64_t, int64_t, float*, int);
++
++    // SD_XPU_H3_LIB=path/to/libxpu_h3.so runs the transformer blocks through libtorch on an Intel XPU.
++    static XpuH3BlocksFn xpu_h3_blocks_fn() {
++        static const XpuH3BlocksFn fn = []() -> XpuH3BlocksFn {
++            const char* path = getenv("SD_XPU_H3_LIB");
++            if (path == nullptr || *path == '\0') {
++                return nullptr;
++            }
++            void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++            if (lib == nullptr) {
++                LOG_ERROR("SD_XPU_H3_LIB: dlopen failed: %s", dlerror());
++                return nullptr;
++            }
++            auto f = reinterpret_cast<XpuH3BlocksFn>(dlsym(lib, "xpu_h3_blocks"));
++            if (f == nullptr) {
++                LOG_ERROR("SD_XPU_H3_LIB: xpu_h3_blocks not found");
++            } else {
++                LOG_INFO("MiniMax-H3 transformer blocks on XPU: %s", path);
++            }
++            return f;
++        }();
++        return fn;
++    }
++
+     struct MiniMaxH3Transformer3DModel : public GGMLBlock {
+         Config config;
+ 
+@@ -688,7 +763,40 @@ namespace MiniMaxH3 {
+                                         curve_upper_indices,
+                                         curve_fractions);
+             auto pe    = build_rope(ctx, position_ids);
+-            for (int64_t i = 0; i < config.num_layers; ++i) {
++            if (auto blocks_fn = xpu_h3_blocks_fn()) {
++                // All transformer blocks on an Intel XPU through libtorch (SD_XPU_H3_LIB); see xpu_sdpa/xpu_h3.cpp.
++                struct XpuH3Args {
++                    XpuH3BlocksFn fn;
++                    std::vector<int64_t> segments;
++                    int64_t heads;
++                    int64_t head_dim;
++                };
++                auto* ud     = new XpuH3Args{blocks_fn, {}, config.num_attention_heads, config.attention_head_dim};
++                for (const auto& seg : segments) {
++                    ud->segments.insert(ud->segments.end(), {seg.start, seg.end, seg.modulation_row});
++                }
++                ggml_tensor* args[3] = {ggml_cont(ctx->ggml_ctx, h),
++                                        ggml_cont(ctx->ggml_ctx, t_emb),
++                                        ggml_cont(ctx->ggml_ctx, pe)};
++                auto op = [](ggml_tensor* dst, int ith, int, void* userdata) {
++                    if (ith != 0) {
++                        return;
++                    }
++                    static const bool verbose = getenv("SD_XPU_H3_VERBOSE") != nullptr;
++                    auto* a        = static_cast<XpuH3Args*>(userdata);
++                    const auto* hh = dst->src[0];
++                    const auto* tt = dst->src[1];
++                    const auto* pp = dst->src[2];
++                    int rc         = a->fn(static_cast<const float*>(hh->data), ggml_nrows(hh), hh->ne[0],
++                                           static_cast<const float*>(tt->data), ggml_nrows(tt), tt->ne[0],
++                                           static_cast<const float*>(pp->data), pp->ne[2],
++                                           a->segments.data(), static_cast<int64_t>(a->segments.size() / 3),
++                                           a->heads, a->head_dim, static_cast<float*>(dst->data), verbose ? 1 : 0);
++                    GGML_ASSERT(rc == 0 && "xpu_h3_blocks failed");
++                };
++                h = ggml_custom_4d(ctx->ggml_ctx, GGML_TYPE_F32, h->ne[0], h->ne[1], h->ne[2], h->ne[3], args, 3, op, 1, ud);
++            }
++            for (int64_t i = 0; i < config.num_layers && xpu_h3_blocks_fn() == nullptr; ++i) {
+                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
+                 h          = block->forward(ctx, h, t_emb, segments, pe);
+                 sd::ggml_graph_cut::mark_graph_cut(h,
+@@ -766,7 +874,8 @@ namespace MiniMaxH3 {
+                                              const std::vector<MiniMaxH3ReferenceBlock>& reference_blocks,
+                                              const sd::Tensor<int32_t>& text_tags,
+                                              float video_t,
+-                                             float audio_timestep) {
++                                             float audio_timestep,
++                                             const std::vector<float>& visual_cond_augs) {
+         PackedSequenceLayout layout;
+         float sqrt_area    = std::sqrt(static_cast<float>(latent_h * latent_w));
+         auto h_axis        = spatial_axis(latent_h, sqrt_area);
+@@ -860,11 +969,76 @@ namespace MiniMaxH3 {
+                                                     row + count,
+                                                     SequenceKind::CONDITION_VIDEO,
+                                                     static_cast<int32_t>(index)});
+-                layout.segments.push_back({row, row + count, condition_time_row * 3});
++                float aug      = index < visual_cond_augs.size() ? visual_cond_augs[index] : VISUAL_COND_TIMESTEP;
++                int time_row   = find_or_add_timestep(&layout.timesteps, std::max(video_t, aug));
++                layout.segments.push_back({row, row + count, time_row * 3});
+                 row += count;
+             }
+         } else {
++            // Guides sit right after text; their anchors count from the target timeline
++            // origin, which starts after every reference block's span.
++            float target_origin = cursor;
+             for (const auto& block : reference_blocks) {
++                if (block.kind == MiniMaxH3ReferenceKind::GUIDE) {
++                    continue;
++                }
++                float span = 0.f;
++                if (block.audio_index >= 0) {
++                    span = static_cast<float>(condition_audios[static_cast<size_t>(block.audio_index)].shape()[0]);
++                }
++                if (block.kind == MiniMaxH3ReferenceKind::IMAGE) {
++                    span = std::max(span, 1.f);
++                } else if (block.video_index >= 0) {
++                    float video_end = 0.f;
++                    for (int64_t t = 0; t < condition_videos[static_cast<size_t>(block.video_index)].shape()[2]; ++t) {
++                        video_end += video_span(t);
++                    }
++                    span = std::max(span, video_end);
++                }
++                target_origin += span;
++            }
++            for (const auto& block : reference_blocks) {
++                if (block.kind != MiniMaxH3ReferenceKind::GUIDE) {
++                    continue;
++                }
++                float cond_t = target_origin + FRAME_RESCALE * static_cast<float>(block.frame_index);
++                if (block.video_index >= 0) {
++                    GGML_ASSERT(block.video_index < static_cast<int32_t>(condition_videos.size()));
++                    const auto& condition = condition_videos[static_cast<size_t>(block.video_index)];
++                    auto axes             = condition_spatial_axes(condition);
++                    int64_t count         = condition.shape()[2] *
++                                    static_cast<int64_t>(axes.first.size() * axes.second.size());
++                    append_video_positions(condition, cond_t);
++                    layout.sequence_segments.push_back({row,
++                                                        row + count,
++                                                        SequenceKind::CONDITION_VIDEO,
++                                                        block.video_index});
++                    size_t aug_index = static_cast<size_t>(block.video_index);
++                    float aug        = aug_index < visual_cond_augs.size() ? visual_cond_augs[aug_index] : VISUAL_COND_TIMESTEP;
++                    int time_row     = find_or_add_timestep(&layout.timesteps, std::max(video_t, aug));
++                    layout.segments.push_back({row, row + count, time_row * 3});
++                    row += count;
++                }
++                if (block.audio_index >= 0) {
++                    GGML_ASSERT(block.audio_index < static_cast<int32_t>(condition_audios.size()));
++                    int64_t length = condition_audios[static_cast<size_t>(block.audio_index)].shape()[0];
++                    int64_t count  = length * 2;
++                    append_audio_positions(length, cond_t, w_axis.front(), w_axis.back());
++                    layout.sequence_segments.push_back({row,
++                                                        row + count,
++                                                        SequenceKind::CONDITION_AUDIO,
++                                                        block.audio_index});
++                    layout.segments.push_back({row,
++                                               row + count,
++                                               audio_condition_time_row * 3 + 2});
++                    row += count;
++                }
++            }
++
++            for (const auto& block : reference_blocks) {
++                if (block.kind == MiniMaxH3ReferenceKind::GUIDE) {
++                    continue;
++                }
+                 const sd::Tensor<float>* ref_video = nullptr;
+                 const sd::Tensor<float>* ref_audio = nullptr;
+                 if (block.video_index >= 0) {
+@@ -970,6 +1144,9 @@ namespace MiniMaxH3 {
+               config(Config::detect_from_weights(tensors, prefix)),
+               model(config) {
+             model.init(params_ctx, tensors, prefix);
++            // XPU block weights load lazily at the first denoising step: video.cpp releases Vulkan's idle
++            // memory just before sampling and calls xpu_h3_release() right after, so the text encoder and
++            // VAE keep the whole GPU.
+         }
+ 
+         std::string get_desc() override {
+@@ -1033,7 +1210,8 @@ namespace MiniMaxH3 {
+                                  const std::vector<MiniMaxH3ReferenceBlock>& reference_blocks,
+                                  int audio_length,
+                                  float video_shift,
+-                                 float audio_shift) {
++                                 float audio_shift,
++                                 const std::vector<float>& visual_cond_augs) {
+             auto split        = split_av_latents(packed, audio_length);
+             video_input_cache = std::move(split.first);
+             audio_input_cache = std::move(split.second);
+@@ -1073,7 +1251,8 @@ namespace MiniMaxH3 {
+                                        reference_blocks,
+                                        text_tags,
+                                        t_v,
+-                                       t_a);
++                                       t_a,
++                                       visual_cond_augs);
+ 
+             position_input_cache = sd::Tensor<float>(
+                 {3, static_cast<int64_t>(layout.positions.size() / 3)},
+@@ -1153,6 +1332,7 @@ namespace MiniMaxH3 {
+             const auto* extra = diffusion_extra_as<MiniMaxH3DiffusionExtra>(params);
+             static const std::vector<sd::Tensor<float>> empty_conditions;
+             static const std::vector<MiniMaxH3ReferenceBlock> empty_reference_blocks;
++            static const std::vector<float> empty_visual_cond_augs;
+             const auto& conditions       = params.ref_latents == nullptr ? empty_conditions : *params.ref_latents;
+             const auto& audio_conditions = extra->reference_audio_latents == nullptr
+                                                ? empty_conditions
+@@ -1160,6 +1340,9 @@ namespace MiniMaxH3 {
+             const auto& reference_blocks = extra->reference_blocks == nullptr
+                                                ? empty_reference_blocks
+                                                : *extra->reference_blocks;
++            const auto& visual_cond_augs = extra->visual_cond_noise_augs == nullptr
++                                               ? empty_visual_cond_augs
++                                               : *extra->visual_cond_noise_augs;
+             const sd::Tensor<int32_t> empty_int;
+             auto get_graph = [&]() {
+                 return build_graph(*params.x,
+@@ -1172,7 +1355,8 @@ namespace MiniMaxH3 {
+                                    reference_blocks,
+                                    extra->audio_length,
+                                    extra->video_sigma_shift,
+-                                   extra->audio_sigma_shift);
++                                   extra->audio_sigma_shift,
++                                   visual_cond_augs);
+             };
+             return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph,
+                                                                        n_threads,
+diff --git c/src/model/diffusion/model.hpp w/src/model/diffusion/model.hpp
+index 957d575..71c7981 100644
+--- c/src/model/diffusion/model.hpp
++++ w/src/model/diffusion/model.hpp
+@@ -103,12 +103,14 @@ enum class MiniMaxH3ReferenceKind : int32_t {
+     VIDEO,
+     AUDIO,
+     VIDEO_AUDIO,
++    GUIDE,  // keyframe guide anchored at frame_index on the target timeline
+ };
+ 
+ struct MiniMaxH3ReferenceBlock {
+     MiniMaxH3ReferenceKind kind = MiniMaxH3ReferenceKind::IMAGE;
+     int32_t video_index         = -1;
+     int32_t audio_index         = -1;
++    int32_t frame_index         = -1;
+ };
+ 
+ struct MiniMaxH3DiffusionExtra {
+@@ -119,6 +121,7 @@ struct MiniMaxH3DiffusionExtra {
+     int audio_length                                              = 0;
+     float video_sigma_shift                                       = 12.f;
+     float audio_sigma_shift                                       = 3.f;
++    const std::vector<float>* visual_cond_noise_augs              = nullptr;
+ };
+ 
+ struct MiniT2IDiffusionExtra {
+diff --git c/src/model/vae/vae.hpp w/src/model/vae/vae.hpp
+index 157b516..84ea3e4 100644
+--- c/src/model/vae/vae.hpp
++++ w/src/model/vae/vae.hpp
+@@ -300,6 +300,18 @@ public:
+                                      bool silent       = false) {
+         int64_t t0              = ggml_time_ms();
+         tiling_params           = resolve_tiling_params(tiling_params);
++        // Decode-only tile override (e.g. SD_VAE_DECODE_TILE=672x768:0.125). Video decode runs in short
++        // temporal windows, so large tiles cut overlap work without the memory cost they have on encode.
++        if (const char* env = getenv("SD_VAE_DECODE_TILE")) {
++            int w = 0, h = 0;
++            float overlap = tiling_params.target_overlap;
++            if (sscanf(env, "%dx%d:%f", &w, &h, &overlap) >= 2 && w > 0 && h > 0) {
++                tiling_params.enabled        = true;
++                tiling_params.tile_size_w    = w;
++                tiling_params.tile_size_h    = h;
++                tiling_params.target_overlap = overlap;
++            }
++        }
+         sd::Tensor<float> input = x;
+         sd::Tensor<float> output;
+ 
+diff --git c/src/model_manager.cpp w/src/model_manager.cpp
+index e719825..8cc2214 100644
+--- c/src/model_manager.cpp
++++ w/src/model_manager.cpp
+@@ -1602,6 +1602,13 @@ void ModelManager::release_compute_backend_params(const std::vector<ggml_tensor*
+     finish_compute_backend_usage(required_states);
+ }
+ 
++void ModelManager::release_idle_device_memory() {
++    for (const auto& entry : workspace_reclaimers_) {
++        entry.second();
++    }
++    release_compute_staging_blocks(false);
++}
++
+ void ModelManager::evict_compute_backend_params(const std::vector<ggml_tensor*>& tensors) {
+     if (tensors.empty()) {
+         return;
+diff --git c/src/model_manager.h w/src/model_manager.h
+index 643fc07..d58e8a2 100644
+--- c/src/model_manager.h
++++ w/src/model_manager.h
+@@ -265,6 +265,9 @@ public:
+     }
+ 
+     bool validate_registered_tensors();
++    // Drop every unpinned device-side weight copy and reclaim idle runner workspaces, e.g. before an
++    // external allocator on the same GPU (the XPU transformer-block library) needs the memory.
++    void release_idle_device_memory();
+     bool load_all_params_eagerly();
+ 
+     bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
+diff --git c/src/pipeline/diffusion_engine.cpp w/src/pipeline/diffusion_engine.cpp
+index 359b27b..28be0df 100644
+--- c/src/pipeline/diffusion_engine.cpp
++++ w/src/pipeline/diffusion_engine.cpp
+@@ -2539,7 +2539,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
+                     condition.c_reference_blocks.empty() ? nullptr : &condition.c_reference_blocks,
+                     audio_length,
+                     std::isfinite(active_flow_shift) ? active_flow_shift : 12.f,
+-                    3.f};
++                    3.f,
++                    condition.c_visual_cond_augs.empty() ? nullptr : &condition.c_visual_cond_augs};
+             } else if (sd_version_is_ltxav(version)) {
+                 diffusion_params.extra = LTXAVDiffusionExtra{
+                     nullptr,
+diff --git c/src/pipeline/generation.h w/src/pipeline/generation.h
+index 34aa000..5f5a6b4 100644
+--- c/src/pipeline/generation.h
++++ w/src/pipeline/generation.h
+@@ -25,6 +25,7 @@ namespace sd::pipeline {
+         std::vector<MiniMaxH3ReferenceBlock> minimax_reference_blocks;
+         std::vector<MiniMaxH3PresentationItem> minimax_presentation_refs;
+         std::vector<int32_t> keyframe_indices;
++        std::vector<float> visual_cond_augs;
+         sd::Tensor<float> denoise_mask;
+         sd::Tensor<float> clip_vision_output;
+         sd::Tensor<float> vace_context;
+diff --git c/src/pipeline/request.cpp w/src/pipeline/request.cpp
+index 075ae67..855d07f 100644
+--- c/src/pipeline/request.cpp
++++ w/src/pipeline/request.cpp
+@@ -176,6 +176,8 @@ namespace sd::pipeline {
+         strength                    = sd_vid_gen_params->strength;
+         cache_params                = &sd_vid_gen_params->cache;
+         vace_strength               = sd_vid_gen_params->vace_strength;
++        init_image_strength         = sd_vid_gen_params->init_image_strength;
++        end_image_strength          = sd_vid_gen_params->end_image_strength;
+         guidance                    = sd_vid_gen_params->sample_params.guidance;
+         high_noise_guidance         = sd_vid_gen_params->high_noise_sample_params.guidance;
+         hires                       = sd_vid_gen_params->hires;
+diff --git c/src/pipeline/request.h w/src/pipeline/request.h
+index fac4aba..5efe7c3 100644
+--- c/src/pipeline/request.h
++++ w/src/pipeline/request.h
+@@ -50,6 +50,8 @@ namespace sd::pipeline {
+         int requested_frames                     = -1;
+         int fps                                  = 16;
+         float vace_strength                      = 1.f;
++        float init_image_strength                = 1.f;
++        float end_image_strength                 = 1.f;
+ 
+         GenerationRequest(StableDiffusionGGML* sd, const sd_img_gen_params_t* sd_img_gen_params);
+ 
+diff --git c/src/pipeline/video.cpp w/src/pipeline/video.cpp
+index 2fcff4c..69d3f0c 100644
+--- c/src/pipeline/video.cpp
++++ w/src/pipeline/video.cpp
+@@ -1,3 +1,4 @@
++#include <dlfcn.h>
+ #include "generation.h"
+ 
+ #include <algorithm>
+@@ -509,18 +510,22 @@ namespace sd::pipeline {
+                 return std::nullopt;
+             }
+ 
+-            auto add_visual_noise = [&](sd::Tensor<float> latent) {
++            auto add_visual_noise = [&](sd::Tensor<float> latent, float strength = 1.f) {
++                float aug = std::clamp(strength, 0.f, 1.f);
++                if (aug >= 1.f) {
++                    aug = MiniMaxH3::VISUAL_COND_TIMESTEP;
++                }
+                 auto condition_rng = std::make_shared<PhiloxRNG>();
+                 condition_rng->manual_seed(static_cast<uint64_t>(request->seed));
+-                return latent * MiniMaxH3::VISUAL_COND_TIMESTEP +
+-                       sd::Tensor<float>::randn_like(latent, condition_rng) *
+-                           (1.f - MiniMaxH3::VISUAL_COND_TIMESTEP);
++                return latent * aug +
++                       sd::Tensor<float>::randn_like(latent, condition_rng) * (1.f - aug);
+             };
+ 
+             auto add_keyframe = [&](const sd::Tensor<float>& image,
+                                     int32_t frame_index,
+-                                    const char* name) -> bool {
+-                if (image.empty()) {
++                                    const char* name,
++                                    float strength) -> bool {
++                if (image.empty() || strength <= 0.f) {
+                     return true;
+                 }
+                 auto video_image = image.reshape({image.shape()[0],
+@@ -533,12 +538,19 @@ namespace sd::pipeline {
+                     LOG_ERROR("failed to encode MiniMax-H3 %s keyframe", name);
+                     return false;
+                 }
++                float aug = std::clamp(strength, 0.f, 1.f);
++                if (aug >= 1.f) {
++                    aug = MiniMaxH3::VISUAL_COND_TIMESTEP;
++                }
++                LOG_INFO("MiniMax-H3 %s keyframe strength %.3f aug %.3f", name, strength, aug);
+                 latents.ref_images.push_back(image);
+-                latents.ref_latents.push_back(add_visual_noise(std::move(latent)));
++                latents.ref_latents.push_back(add_visual_noise(std::move(latent), strength));
+                 latents.keyframe_indices.push_back(frame_index);
++                latents.visual_cond_augs.push_back(aug);
+                 return true;
+             };
+ 
++
+             auto resize_reference = [&](const sd::Tensor<float>& image,
+                                         int width,
+                                         int height) {
+@@ -713,13 +725,83 @@ namespace sd::pipeline {
+                 }
+             }
+ 
++            if (sd_vid_gen_params->guides_count > 0) {
++                if (sd_vid_gen_params->guides == nullptr) {
++                    LOG_ERROR("invalid MiniMax-H3 guide array");
++                    return std::nullopt;
++                }
++                if (!start_image.empty() || !end_image.empty()) {
++                    LOG_ERROR("MiniMax-H3 guides replace --init-img/--end-img; anchor them as guides at frame 0 and -1");
++                    return std::nullopt;
++                }
++                for (int i = 0; i < sd_vid_gen_params->guides_count; ++i) {
++                    const auto& guide = sd_vid_gen_params->guides[i];
++                    int frame_idx     = guide.frame_idx >= 0 ? guide.frame_idx : request->frames + guide.frame_idx;
++                    if (frame_idx < 0 || frame_idx >= request->frames) {
++                        LOG_ERROR("MiniMax-H3 guide %d frame_idx %d is outside the video's %d frames",
++                                  i + 1, guide.frame_idx, request->frames);
++                        return std::nullopt;
++                    }
++                    MiniMaxH3ReferenceBlock block{MiniMaxH3ReferenceKind::GUIDE, -1, -1, frame_idx};
++                    if (guide.image.data != nullptr) {
++                        auto image = ensure_image_tensor_channels(
++                            sd_image_to_tensor(guide.image, request->width, request->height),
++                            sd->get_image_channels());
++                        auto video_image = image.reshape({image.shape()[0], image.shape()[1], 1,
++                                                          image.shape()[2], image.shape()[3]});
++                        auto latent      = sd->encode_first_stage(video_image);
++                        if (latent.empty()) {
++                            LOG_ERROR("failed to encode MiniMax-H3 guide %d", i + 1);
++                            return std::nullopt;
++                        }
++                        float strength = guide.strength > 0.f ? guide.strength : 1.f;
++                        float aug      = std::min(strength, 1.f);
++                        if (aug >= 1.f) {
++                            aug = MiniMaxH3::VISUAL_COND_TIMESTEP;
++                        }
++                        latents.visual_cond_augs.resize(latents.ref_latents.size(), MiniMaxH3::VISUAL_COND_TIMESTEP);
++                        block.video_index = static_cast<int32_t>(latents.ref_latents.size());
++                        latents.ref_latents.push_back(add_visual_noise(std::move(latent), strength));
++                        latents.visual_cond_augs.push_back(aug);
++                    }
++                    if (guide.audio.data != nullptr && guide.audio.sample_count > 0) {
++                        int32_t audio_index = -1;
++                        if (!encode_reference_audio(guide.audio, &audio_index)) {
++                            return std::nullopt;
++                        }
++                        auto& encoded  = latents.reference_audio_latents[static_cast<size_t>(audio_index)];
++                        int64_t max_rt = static_cast<int64_t>(std::floor(latents.audio_length -
++                                                                         MiniMaxH3::FRAME_RESCALE * frame_idx));
++                        if (max_rt < 1) {
++                            LOG_ERROR("MiniMax-H3 guide %d frame_idx %d is past the end of the audio track",
++                                      i + 1, frame_idx);
++                            return std::nullopt;
++                        }
++                        if (encoded.shape()[0] > max_rt) {
++                            encoded = sd::ops::slice(encoded, 0, 0, max_rt);
++                        }
++                        block.audio_index = audio_index;
++                    }
++                    if (block.video_index < 0 && block.audio_index < 0) {
++                        LOG_ERROR("MiniMax-H3 guide %d needs an image or audio", i + 1);
++                        return std::nullopt;
++                    }
++                    LOG_INFO("MiniMax-H3 guide %d at frame %d: %s%s (strength %.3f)",
++                             i + 1, frame_idx,
++                             block.video_index >= 0 ? "image" : "",
++                             block.audio_index >= 0 ? (block.video_index >= 0 ? "+audio" : "audio") : "",
++                             guide.strength > 0.f ? guide.strength : 1.f);
++                    latents.minimax_reference_blocks.push_back(block);
++                }
++            }
++
+             if (!has_references && (!start_image.empty() || !end_image.empty())) {
+                 LOG_INFO(!start_image.empty() && !end_image.empty() ? "MiniMax-H3 FL2VA" : !start_image.empty() ? "MiniMax-H3 I2VA"
+                                                                                                                 : "MiniMax-H3 end-frame conditioning");
+             }
+             if (!has_references &&
+-                (!add_keyframe(start_image, 0, "start") ||
+-                 !add_keyframe(end_image, request->frames - 1, "end"))) {
++                (!add_keyframe(start_image, 0, "start", request->init_image_strength) ||
++                 !add_keyframe(end_image, request->frames - 1, "end", request->end_image_strength))) {
+                 return std::nullopt;
+             }
+         }
+@@ -1173,6 +1255,7 @@ namespace sd::pipeline {
+             embeds.cond.c_ref_images       = latents.ref_latents;
+             embeds.cond.c_ref_audios       = latents.reference_audio_latents;
+             embeds.cond.c_reference_blocks = latents.minimax_reference_blocks;
++            embeds.cond.c_visual_cond_augs = latents.visual_cond_augs;
+             if (!latents.keyframe_indices.empty()) {
+                 embeds.cond.c_position_ids = sd::Tensor<int32_t>(
+                     {static_cast<int64_t>(latents.keyframe_indices.size())},
+@@ -1199,6 +1282,7 @@ namespace sd::pipeline {
+                 embeds.uncond.c_ref_audios       = latents.reference_audio_latents;
+                 embeds.uncond.c_reference_blocks = latents.minimax_reference_blocks;
+                 embeds.uncond.c_position_ids     = embeds.cond.c_position_ids;
++                embeds.uncond.c_visual_cond_augs = latents.visual_cond_augs;
+             }
+             if (sd->version == VERSION_WAN2_2_S2V) {
+                 embeds.uncond.c_ref_images = latents.ref_latents;
+@@ -1609,6 +1693,10 @@ namespace sd::pipeline {
+                      request.height,
+                      request.frames);
+         } else {
++            if (getenv("SD_XPU_H3_LIB") != nullptr && sd->model_manager != nullptr) {
++                // the XPU transformer blocks allocate through Level Zero on the same GPU
++                sd->model_manager->release_idle_device_memory();
++            }
+             LOG_INFO("generate_video %dx%dx%d",
+                      request.width,
+                      request.height,
+@@ -1710,6 +1798,14 @@ namespace sd::pipeline {
+             return false;
+         }
+         LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
++        if (const char* xpu_lib = getenv("SD_XPU_H3_LIB")) {
++            // hand the GPU back to Vulkan for the VAE decode
++            if (void* lib = dlopen(xpu_lib, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD)) {
++                if (auto release = reinterpret_cast<void (*)()>(dlsym(lib, "xpu_h3_release"))) {
++                    release();
++                }
++            }
++        }
+ 
+         if (latent_upscale_enabled) {
+             if (sd->get_cancel_flag() == SD_CANCEL_ALL) {
+diff --git c/src/stable-diffusion.cpp w/src/stable-diffusion.cpp
+index b13c055..9e7784e 100644
+--- c/src/stable-diffusion.cpp
++++ w/src/stable-diffusion.cpp
+@@ -613,6 +613,8 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
+     sd_vid_gen_params->fps                                   = 16;
+     sd_vid_gen_params->moe_boundary                          = 0.875f;
+     sd_vid_gen_params->vace_strength                         = 1.f;
++    sd_vid_gen_params->init_image_strength                   = 1.f;
++    sd_vid_gen_params->end_image_strength                    = 1.f;
+     sd_vid_gen_params->vae_tiling_params                     = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
+     sd_vid_gen_params->hires.enabled                         = false;
+     sd_vid_gen_params->hires.upscaler                        = SD_HIRES_UPSCALER_LATENT;
